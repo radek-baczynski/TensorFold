@@ -15,28 +15,42 @@ namespace {
 using namespace qmm_frag;
 
 __device__ __forceinline__ void mma8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 890
     asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
         "{%0, %1, %2, %3};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    (void)a; (void)b0; (void)b1;
+#endif
 }
 
 __device__ __forceinline__ void mma8z(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 890
     const float z = 0.0f;
     asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
         "{%10, %10, %10, %10};\n"
         : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(z));
+#else
+    d[0] = d[1] = d[2] = d[3] = 0.0f;
+    (void)a; (void)b0; (void)b1;
+#endif
 }
 
 // e4m3 of the nibbles at bits [s, s + 4) (low byte) and [16 + s, 20 + s) (high byte): f16 1024 + q, minus 1024, cvt.
 __device__ __forceinline__ uint32_t e4m3_pair(uint32_t w, int s) {
+#if __CUDA_ARCH__ >= 890
     const uint32_t t = ((w >> s) & 0x000F000Fu) | 0x64006400u;
     uint32_t h;
     asm("sub.rn.f16x2 %0, %1, %2;\n" : "=r"(h) : "r"(t), "r"(0x64006400u));
     uint16_t r;
     asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(r) : "r"(h));
     return r;
+#else
+    (void)w; (void)s;
+    return 0;
+#endif
 }
 
 // One k32 step's weight fragment from a lane's word: nibble slots (0, 4, 1, 5) and (2, 6, 3, 7) as e4m3.
@@ -254,7 +268,8 @@ void launch(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& scale, 
         configured = true;
     }
     const int rows_t = (M + BM - 1) / BM;
-    const int group = std::max(1, std::min(rows_t, static_cast<int>((12LL << 20) / (static_cast<long long>(BM) * K))));
+    const int group = std::max(1, std::min(rows_t, static_cast<int>(
+        static_cast<long long>(l2_group_bytes()) / (static_cast<long long>(BM) * K))));
     kernel<<<rows_t * ((N + BN - 1) / BN), T::THREADS, T::SMEM, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const uint8_t*>(x.data_ptr()),
         W8 ? nullptr : reinterpret_cast<const __nv_bfloat16*>(xs.data_ptr()), scale.data_ptr<float>(),
@@ -290,6 +305,11 @@ void dispatch_w8(int tile, const at::Tensor& x, const at::Tensor& a, const at::T
 void qmm_prefill8_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& w,
                        const at::Tensor& scales, const at::Tensor& biases, at::Tensor& out, int N, int gs, bool f32,
                        int tile) {
+    int major = 0, minor = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0);
+    TORCH_CHECK(major > 8 || (major == 8 && minor >= 9),
+                "FP8 prefill needs compute capability 8.9 or newer; this GPU is ", major, ".", minor);
     if (gs == 64) { if (f32) dispatch<64, true>(tile, x, xs, a, w, scales, biases, out, N); else dispatch<64, false>(tile, x, xs, a, w, scales, biases, out, N); }
     else { if (f32) dispatch<32, true>(tile, x, xs, a, w, scales, biases, out, N); else dispatch<32, false>(tile, x, xs, a, w, scales, biases, out, N); }
 }
@@ -298,6 +318,11 @@ void qmm_prefill8_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tens
 // ``l64``: 32-input groups read from bytes stored in the 64-input order (MXFP8: one copy for decode and prompts).
 void qmm_prefill8w_cuda(const at::Tensor& x, const at::Tensor& a, const at::Tensor& w, const at::Tensor& scales,
                         at::Tensor& out, int N, int gs, bool f32, int tile, bool l64) {
+    int major = 0, minor = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0);
+    TORCH_CHECK(major > 8 || (major == 8 && minor >= 9),
+                "FP8 prefill needs compute capability 8.9 or newer; this GPU is ", major, ".", minor);
     if (l64) { if (f32) dispatch_w8<32, true, true>(tile, x, a, w, scales, out, N); else dispatch_w8<32, false, true>(tile, x, a, w, scales, out, N); }
     else if (gs == 32) { if (f32) dispatch_w8<32, true>(tile, x, a, w, scales, out, N); else dispatch_w8<32, false>(tile, x, a, w, scales, out, N); }
     else { if (f32) dispatch_w8<64, true>(tile, x, a, w, scales, out, N); else dispatch_w8<64, false>(tile, x, a, w, scales, out, N); }

@@ -132,12 +132,21 @@ __device__ __forceinline__ void decode_lane(const uint32_t (&w)[lane_words<K2>()
 __device__ __forceinline__ int value_row(int lane, int j) { return 2 * (lane & 3) + (j & 1) + 8 * ((j >> 1) & 1); }
 __device__ __forceinline__ int value_col(int lane, int j) { return (lane >> 2) + 8 * (j >> 2); }
 
-// mma.m16n8k16, fp16 inputs, fp32 accumulators: d += a @ b.
+// mma.m16n8k16, fp16 inputs, fp32 accumulators: d += a @ b. Turing runs it as two m16n8k8 steps.
 __device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b[0]));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[2]), "r"(a[3]), "r"(b[1]));
+#endif
 }
 
 // Unscaled Walsh-Hadamard transform of 128 fp32 values, 4 a lane, in a fixed butterfly order (multiply by 1/sqrt(128)).

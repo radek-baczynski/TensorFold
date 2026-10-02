@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <stdint.h>
 
 namespace {
@@ -21,14 +22,26 @@ struct Geo {
 };
 
 __device__ __forceinline__ void cp16(void* dst, const void* src) {
+#if __CUDA_ARCH__ >= 800
   const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
+#else
+  *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+#endif
 }
 
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void cp_commit() {
+#if __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
 
 template <int N>
-__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void cp_wait() {
+#if __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
 
 __device__ __forceinline__ uint32_t comp(const uint4& v, int c) {
   return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w;
@@ -42,12 +55,28 @@ __device__ __forceinline__ uint32_t nib2(uint32_t w, int sh) {
   return *reinterpret_cast<uint32_t*>(&r);
 }
 
+__device__ __forceinline__ uint32_t bf16_to_fp16(uint32_t v) {
+  const float lo = __uint_as_float((v & 0xffffu) << 16);
+  const float hi = __uint_as_float(v & 0xffff0000u);
+  const __half2 h = __floats2half2_rn(lo, hi);
+  return *reinterpret_cast<const uint32_t*>(&h);
+}
+
 __device__ __forceinline__ void mma(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                     uint32_t b1) {
+#if __CUDA_ARCH__ >= 800
   asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
       "{%0, %1, %2, %3};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+  a0 = bf16_to_fp16(a0); a1 = bf16_to_fp16(a1); a2 = bf16_to_fp16(a2); a3 = bf16_to_fp16(a3);
+  b0 = bf16_to_fp16(b0); b1 = bf16_to_fp16(b1);
+  asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a0), "r"(a1), "r"(b0));
+  asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a2), "r"(a3), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ float lo_f(uint32_t v) { return __uint_as_float(v << 16); }

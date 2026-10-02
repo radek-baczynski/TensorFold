@@ -264,6 +264,13 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     from tensorfold.cuda import prompt_precision
 
     asked = getattr(args, "prefill_fp8", None)
+    if asked:
+        import torch
+
+        cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+        if cap < (8, 9):
+            raise ValueError(f"--prefill-fp8 needs compute capability 8.9 or newer (FP8 tensor cores); this GPU is "
+                             f"{cap[0]}.{cap[1]}")
     prompt_precision.set_fp8(prompt_precision.FP8_BY_DEFAULT if asked is None else asked)   # before any weight loads
     engine = family.package.cuda_engine(model_dir, **options)
     fp8 = prompt_precision.fp8() and bool(getattr(getattr(engine, "w", None), "fast_prefill", False))

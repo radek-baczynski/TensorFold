@@ -28,9 +28,7 @@ struct Tile {
 };
 
 __device__ __forceinline__ uint32_t fma2(uint32_t a, uint32_t b, uint32_t c) {
-    uint32_t d;
-    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
-    return d;
+    return fma_bf16x2(a, b, c);
 }
 
 template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32>
@@ -53,8 +51,8 @@ __global__ void __launch_bounds__(WM * WN * 32) prefill_kernel(
         for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
             const int r = c / T::CHUNKS, ch = c % T::CHUNKS;
             const int row = min(m0 + r, M - 1);
-            cp16z(p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16, x + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
-                  m0 + r < M);
+            cp16z_act(p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16, x + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
+                      m0 + r < M);
         }
         unsigned char* pw = p + T::X;
         constexpr int TILE_BYTES = 64 * GS / 2;           // one stored 64-column tile's group block
@@ -113,10 +111,18 @@ __global__ void __launch_bounds__(WM * WN * 32) prefill_kernel(
             }
 #pragma unroll
             for (int j = 0; j < T::NT; ++j) {
+#if __CUDA_ARCH__ >= 800
                 const uint32_t b0 = fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]);
                 const uint32_t b1 = fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]);
 #pragma unroll
                 for (int i = 0; i < T::MT; ++i) mma(acc[i][j], a[i], b0, b1);
+#else
+                // inputs are fp16 in shared memory: the weights convert once here, not in every mma
+                const uint32_t b0 = weight_fp16x2(words[j][kt / 2], (kt & 1) * 8, sv[j], bv[j]);
+                const uint32_t b1 = weight_fp16x2(words[j][kt / 2], (kt & 1) * 8 + 4, sv[j], bv[j]);
+#pragma unroll
+                for (int i = 0; i < T::MT; ++i) mma_h(acc[i][j], a[i], b0, b1);
+#endif
             }
         }
     }
@@ -162,7 +168,8 @@ void launch(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, 
     }
     const int rows_t = (M + BM - 1) / BM;
     // a group's inputs stay near 12 MB of L2 while its blocks sweep the column tiles
-    const int group = std::max(1, std::min(rows_t, static_cast<int>((12LL << 20) / (static_cast<long long>(BM) * K * 2))));
+    const int group = std::max(1, std::min(rows_t, static_cast<int>(
+        static_cast<long long>(l2_group_bytes()) / (static_cast<long long>(BM) * K * 2))));
     kernel<<<rows_t * ((N + BN - 1) / BN), T::THREADS, T::SMEM, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const uint32_t*>(w.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(scales.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(biases.data_ptr()),

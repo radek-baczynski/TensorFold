@@ -21,7 +21,11 @@ constexpr float LOG2E = 1.4426950408889634f;
 constexpr int SMEM_MAX = 96 * 1024;
 
 template <int N>
-__device__ __forceinline__ void wait_group() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void wait_group() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
 
 __device__ __forceinline__ void ldmatrix4t(uint32_t (&r)[4], const void* p) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -248,10 +252,10 @@ pattn_kernel(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restric
     }
 }
 
-template <int D, int WARPS, int HPC>
+template <int D, int WARPS, int HPC, int BUDGET>
 void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, at::Tensor& out, int p0, float scale) {
     constexpr int QBYTES = D <= 128 ? 0 : WARPS * 16 * D * 2, SLOT = HALF * D * 2;
-    constexpr int NS = (SMEM_MAX - QBYTES) / SLOT < 8 ? (SMEM_MAX - QBYTES) / SLOT : 8;
+    constexpr int NS = (BUDGET - QBYTES) / SLOT < 8 ? (BUDGET - QBYTES) / SLOT : 8;
     static_assert(NS >= 2, "shared memory for two slots");
     constexpr int smem = NS * SLOT + QBYTES;
     static const cudaError_t configured =
@@ -266,14 +270,29 @@ void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, at::T
         W, H, HK, G, scale);
 }
 
+template <int D, int WARPS, int BUDGET>
+void dispatch_warps(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, at::Tensor& out, int p0,
+                    float scale, int hpc) {
+    switch (hpc) {                                     // WARPS: HPC heads x (WARPS / HPC) 16-row blocks
+        case 1: launch<D, WARPS, 1, BUDGET>(q, k, v, out, p0, scale); break;
+        case 2: launch<D, WARPS, 2, BUDGET>(q, k, v, out, p0, scale); break;
+        case 4: launch<D, WARPS, 4, BUDGET>(q, k, v, out, p0, scale); break;
+        default: launch<D, WARPS, 8, BUDGET>(q, k, v, out, p0, scale); break;
+    }
+}
+
 template <int D>
 void dispatch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, at::Tensor& out, int p0, float scale,
               int hpc) {
-    switch (hpc) {                                     // eight warps: HPC heads x (8 / HPC) 16-row blocks
-        case 1: launch<D, 8, 1>(q, k, v, out, p0, scale); break;
-        case 2: launch<D, 8, 2>(q, k, v, out, p0, scale); break;
-        case 4: launch<D, 8, 4>(q, k, v, out, p0, scale); break;
-        default: launch<D, 8, 8>(q, k, v, out, p0, scale); break;
+    int optin = 0;
+    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+    // head_dim 256 keeps every warp's queries in shared memory. Eight warps need 64 KiB before any key slot,
+    // which is the whole Turing budget, so those cards run four warps (hpc capped at 4).
+    if (D > 128 && optin < 96 * 1024) {
+        if (hpc > 4) hpc = 4;
+        dispatch_warps<D, 4, 64 * 1024>(q, k, v, out, p0, scale, hpc);
+    } else {
+        dispatch_warps<D, 8, SMEM_MAX>(q, k, v, out, p0, scale, hpc);
     }
 }
 

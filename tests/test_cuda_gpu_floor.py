@@ -8,8 +8,8 @@ torch = pytest.importorskip("torch")
 
 from tensorfold.cuda import build, capacity  # noqa: E402
 
-GPUS = [((8, 6), "NVIDIA GeForce RTX 3090"), ((8, 9), "NVIDIA GeForce RTX 4090"), ((9, 0), "NVIDIA H100"),
-        ((12, 1), "NVIDIA GB10")]
+GPUS = [((7, 5), "NVIDIA GeForce RTX 2080 Ti"), ((8, 6), "NVIDIA GeForce RTX 3090"),
+        ((8, 9), "NVIDIA GeForce RTX 4090"), ((9, 0), "NVIDIA H100"), ((12, 1), "NVIDIA GB10")]
 
 
 def _gpu(monkeypatch, capability, name):

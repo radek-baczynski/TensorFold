@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Sequence
 
 import torch
@@ -38,22 +40,24 @@ def _paths(PARENTS, PATHS, DEPTHS, MAXD: tl.constexpr):
 
 
 @triton.jit
-def _tile(q, k, v, m, l, o, valid, scale: tl.constexpr):
-    scores = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
+def _tile(q, k, v, m, l, o, valid, scale: tl.constexpr, FP16: tl.constexpr):
+    # Turing tensor cores are fp16. Ampere and newer keep the bf16 dot.
+    dot = tl.float16 if FP16 else tl.bfloat16
+    scores = tl.dot(q.to(dot), tl.trans(k.to(dot))).to(tl.float32) * scale
     scores = tl.where(valid[None, :], scores, float("-inf"))
     tile_m = tl.max(scores, 1)
     active = tile_m != float("-inf")
     next_m = tl.where(active, tl.maximum(m, tile_m), m)
     alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
     p = tl.where(valid[None, :] & active[:, None], tl.exp(scores - next_m[:, None]), 0.0)
-    o = o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+    o = o * alpha[:, None] + tl.dot(p.to(dot), v.to(dot))
     l = l * alpha + tl.sum(p, 1)
     return next_m, l, o
 
 
 @triton.jit
 def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr,
-            G: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr):
+            G: tl.constexpr, CH: tl.constexpr, KT: tl.constexpr, SCALE: tl.constexpr, FP16: tl.constexpr):
     """(Item, KV head), heads fastest: 16 (row, head) pairs of one stream against one chunk of committed keys."""
 
     item = tl.program_id(0) // HK            # a chunk's heads and query tiles launch together: one DRAM read
@@ -72,17 +76,17 @@ def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, H: tl.constexpr, HK: t
         node = start + rr // G
         head = hk * G + rr % G
         d = tl.arange(0, D)
-        key = chunk * CH + tl.arange(0, 64)
+        key = chunk * CH + tl.arange(0, KT)
         q = tl.load(Q + (node[:, None] * H + head[:, None]) * D + d[None, :], mask=ok[:, None],
                     other=0).to(tl.bfloat16)
         m = tl.full((16,), float("-inf"), tl.float32)
         l = tl.zeros((16,), tl.float32)
         o = tl.zeros((16, D), tl.float32)
-        for t in range(CH // 64):
-            ki = key + t * 64
+        for t in range(CH // KT):
+            ki = key + t * KT
             kk = tl.load(KC + koff + (ki[:, None] * HK + hk) * D + d[None, :]).to(tl.bfloat16)
             vv = tl.load(VC + voff + (ki[:, None] * HK + hk) * D + d[None, :]).to(tl.bfloat16)
-            m, l, o = _tile(q, kk, vv, m, l, o, ki < p, SCALE)
+            m, l, o = _tile(q, kk, vv, m, l, o, ki < p, SCALE, FP16)
         base = (chunk * W + node) * H + head
         tl.store(PO + base[:, None] * D + d[None, :], o, mask=ok[:, None])
         tl.store(PM + base, m, mask=ok)
@@ -91,7 +95,8 @@ def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, H: tl.constexpr, HK: t
 
 @triton.jit
 def _tail(Q, KN, VN, KC, VC, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, H: tl.constexpr, HK: tl.constexpr,
-          D: tl.constexpr, G: tl.constexpr, CH: tl.constexpr, MAXD: tl.constexpr, SCALE: tl.constexpr):
+          D: tl.constexpr, G: tl.constexpr, CH: tl.constexpr, KT: tl.constexpr, MAXD: tl.constexpr, SCALE: tl.constexpr,
+          FP16: tl.constexpr):
     """Row, head group, tail chunk: the last committed keys and the row's own path."""
 
     node = tl.program_id(0)
@@ -110,9 +115,11 @@ def _tail(Q, KN, VN, KC, VC, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, H:
         m = tl.full((16,), float("-inf"), tl.float32)
         l = tl.zeros((16,), tl.float32)
         o = tl.zeros((16, D), tl.float32)
-        key = chunk * CH + tl.arange(0, 64)
-        for t in range(CH // 64):
-            logical = key + t * 64
+        key = chunk * CH + tl.arange(0, KT)
+        # tiles past the last committed key and path key hold no valid key: they leave m, l and o as they are
+        ntiles = (tl.minimum(p + depth, (chunk + 1) * CH) - chunk * CH + KT - 1) // KT
+        for t in range(ntiles):
+            logical = key + t * KT
             committed = logical < p
             path_slot = logical - p
             on_path = (path_slot >= 0) & (path_slot < depth)
@@ -123,7 +130,7 @@ def _tail(Q, KN, VN, KC, VC, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, H:
             vn = tl.load(VN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
             kk = tl.where(committed[:, None], kc, kn).to(tl.bfloat16)
             vv = tl.where(committed[:, None], vc, vn).to(tl.bfloat16)
-            m, l, o = _tile(q, kk, vv, m, l, o, committed | on_path, SCALE)
+            m, l, o = _tile(q, kk, vv, m, l, o, committed | on_path, SCALE, FP16)
         base = (chunk * W + node) * H + hk * G + gg
         tl.store(PO + base[:, None] * D + d[None, :], o, mask=gg[:, None] < G)
         tl.store(PM + base, m, mask=gg < G)
@@ -266,17 +273,50 @@ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, off
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("scale must be positive and finite")
     g = h // hk
+    # Head dim 256 with a 64-key tile needs 80 KiB of shared memory. Turing stops at 64 KiB, so those cards
+    # fold the same chunk in 32-key steps. Ampere and newer keep the 64-key tile.
+    fp16 = torch.cuda.get_device_capability(q.device) < (8, 0)
+    kt = 32 if fp16 else 64
     partial_o = torch.empty((p.chunks, w, h, d), dtype=torch.float32, device=q.device)
     partial_m = torch.empty((p.chunks, w, h), dtype=torch.float32, device=q.device)
     partial_l = torch.empty_like(partial_m)
-    if p.items.shape[0]:
-        _shared[(p.items.shape[0] * hk,)](q, origin, origin, offs, p.streams, p.items, partial_o, partial_m, partial_l,
-                                          w, H=h, HK=hk, D=d, G=g, CH=CHUNK, SCALE=scale, num_warps=4, num_stages=1)
     tails = 1 + -(-MAX_NODES // CHUNK)
-    _tail[(w, hk, tails)](q, k_nodes, v_nodes, origin, origin, offs, p.streams, p.rows, p.paths, p.depths,
-                          partial_o, partial_m, partial_l, w, H=h, HK=hk, D=d, G=g, CH=CHUNK, MAXD=MAX_NODES,
-                          SCALE=scale, num_warps=4, num_stages=1)
+    if fp16 and _turing_kernels(h, hk, d):
+        # Turing: both halves fold a key with one tile step (decode_attention.cu), so a key's bits do not depend on
+        # whether its chunk is committed or holds the row's path
+        ext = _decode_ext()
+        if p.items.shape[0]:
+            ext.decode_chunks(q, origin, offs, p.streams, p.items, partial_o, partial_m, partial_l, hk, g, scale)
+        ext.decode_tail(q, k_nodes, v_nodes, origin, offs, p.streams, p.rows, p.paths, p.depths, partial_o, partial_m,
+                        partial_l, hk, g, scale, tails)
+    else:
+        if p.items.shape[0]:
+            _shared[(p.items.shape[0] * hk,)](q, origin, origin, offs, p.streams, p.items, partial_o, partial_m,
+                                              partial_l, w, H=h, HK=hk, D=d, G=g, CH=CHUNK, KT=kt, SCALE=scale,
+                                              FP16=fp16, num_warps=4, num_stages=1)
+        _tail[(w, hk, tails)](q, k_nodes, v_nodes, origin, origin, offs, p.streams, p.rows, p.paths, p.depths,
+                              partial_o, partial_m, partial_l, w, H=h, HK=hk, D=d, G=g, CH=CHUNK, KT=kt,
+                              MAXD=MAX_NODES, SCALE=scale, FP16=fp16, num_warps=4, num_stages=1)
     out = torch.empty_like(q)
     _merge[(w, hk, d // MERGE_COLUMNS)](partial_o, partial_m, partial_l, out, p.streams, p.rows, w, H=h, D=d, G=g,
                                         DS=MERGE_COLUMNS, num_warps=4)
     return out
+
+
+def _turing_kernels(heads: int, kv_heads: int, dim: int) -> bool:
+    """Whether ``decode_attention.cu`` serves this model's attention: 24 query heads over 4 KV heads of 256, any window.
+
+    The choice depends on the model alone, never on a window: `_shared`/`decode_chunks` and `_tail`/`decode_tail`
+    fold a key with the same arithmetic only within one family."""
+
+    return os.environ.get("TF_ATTN_CUDA", "1") != "0" and dim == 256 and heads == 24 and kv_heads == 4
+
+
+@lru_cache(maxsize=1)
+def _decode_ext():
+    from tensorfold.cuda.build import load
+
+    here = Path(__file__).parent
+    return load(name="tensorfold_decode_attention_v1", sources=[str(here / "decode_attention.cpp"),
+                                                                str(here / "decode_attention.cu")],
+                extra_cuda_cflags=["-O3"], verbose=False)

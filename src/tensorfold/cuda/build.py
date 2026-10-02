@@ -6,8 +6,9 @@ import os
 import threading
 from typing import Any
 
-MIN_CAPABILITY = (8, 9)         # FP8 MMA and e4m3 conversions (Ada); kernels with clusters use them from 9.0
+MIN_CAPABILITY = (7, 5)         # Turing: fp16 m16n8k8 and ldmatrix. bf16 m16n8k16 / cp.async from 8.0, FP8 from 8.9
 CLUSTERS = (9, 0)               # extensions built only on thread-block clusters (NVFP4) need Hopper or newer
+FP8_MMA = (8, 9)                # e4m3 tensor cores (Ada). The FP8 prompt kernels refuse anything older
 # stop first: when the lock goes, a waiting start imports whatever module is there without building, even an old one
 HINT = "if no other build is running, a killed build left it: stop this start, delete the lock and start again"
 LOCK_WAIT_SECONDS = 60.0        # a start still waiting on the same lock this long says so again
@@ -20,7 +21,7 @@ def arch_flags(need: tuple[int, int] = MIN_CAPABILITY) -> list[str]:
 
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) < need:
-        why = "thread-block clusters" if need >= CLUSTERS else "FP8 MMA"
+        why = "thread-block clusters" if need >= CLUSTERS else "FP8 MMA" if need >= FP8_MMA else "CUDA"
         raise RuntimeError(f"TensorFold's CUDA kernels need compute capability {need[0]}.{need[1]} or newer ({why}"
                            f"{' for these weights' if need > MIN_CAPABILITY else ''}); this GPU "
                            f"({torch.cuda.get_device_name()}) is {major}.{minor}")
@@ -114,4 +115,4 @@ def _say(text: str) -> None:
     print(f"[tensorfold] {text}", flush=True)
 
 
-__all__ = ["CLUSTERS", "MIN_CAPABILITY", "arch_flags", "load"]
+__all__ = ["CLUSTERS", "FP8_MMA", "MIN_CAPABILITY", "arch_flags", "load"]

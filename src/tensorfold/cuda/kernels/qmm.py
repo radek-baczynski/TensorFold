@@ -158,8 +158,11 @@ def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int | 
 
 
 def prompt_tile(m: int, n: int) -> int:
-    """The prompt matmul's tile: 128x128 on four 64x64 warps, two blocks an SM, tuned for a GB10."""
+    """The prompt matmul's tile. Turing's 64 KiB shared memory holds one 128x256 block of two stages (8 warps, fp16
+    inputs: 37 TFLOPS on a 2080 Ti against 21 for 64x128); larger caches keep the GB10 tile."""
 
+    if torch.cuda.get_device_capability() < (8, 0):
+        return 11
     return 9
 
 
